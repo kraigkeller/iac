@@ -441,12 +441,6 @@ Verify cloud-init is enabled:
 sudo systemctl status cloud-init
 ```
 
-### Support Contacts
-
-- Infrastructure Team: infrastructure@example.com
-- GitHub Issues: <repository-url>/issues
-- Slack: #platform-engineering
-
 ## Maintenance
 
 ### Regular Updates
