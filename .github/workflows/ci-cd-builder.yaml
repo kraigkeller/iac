@@ -1,0 +1,703 @@
+name: Golden Image CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+    paths:
+      - 'ansible/**'
+      - 'packer/**'
+      - '.github/workflows/**'
+  
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'ansible/**'
+      - 'packer/**'
+  
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - production
+      version:
+        description: 'Image version (semver)'
+        required: true
+        type: string
+        default: '1.0.0'
+
+env:
+  PACKER_VERSION: '1.10.0'
+  ANSIBLE_VERSION: '2.15.5'
+  AWS_REGION: 'us-east-1'
+  
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write
+
+jobs:
+  # Job 1: Validate configuration files
+  validate:
+    name: Validate Packer and Ansible
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Packer
+        uses: hashicorp/setup-packer@main
+        with:
+          version: ${{ env.PACKER_VERSION }}
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install Ansible
+        run: |
+          pip install ansible==${{ env.ANSIBLE_VERSION }}
+          pip install ansible-lint
+          ansible --version
+      
+      - name: Packer Format Check
+        working-directory: packer
+        run: packer fmt -check golden-image.pkr.hcl
+
+      - name: Packer Validate
+        working-directory: packer
+        run: |
+          packer init golden-image.pkr.hcl
+          packer validate \
+            -var "environment=dev" \
+            -var "image_version=${{ github.event.inputs.version || '1.0.0' }}" \
+            golden-image.pkr.hcl
+      
+      - name: Ansible Syntax Check
+        working-directory: ansible
+        run: |
+          ansible-playbook playbook.yml --syntax-check
+      
+      - name: Ansible Lint
+        working-directory: ansible
+        run: |
+          ansible-lint playbook.yml || true
+        continue-on-error: true
+      
+      - name: Validation Summary
+        run: echo "Validation complete"
+
+  sbom-generation:
+    name: Generate SBOM
+    runs-on: ubuntu-latest
+    needs: validate
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Generate SBOM with Syft
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+          syft scan dir:ansible -o cyclonedx-json=sbom.json
+          syft scan dir:packer -o cyclonedx-json=sbom-packer.json
+
+      - name: Upload SBOM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ github.run_id }}
+          path: sbom*.json
+          retention-days: 365
+
+  build-dev:
+    name: Build DEV Golden Image
+    runs-on: ubuntu-latest
+    needs: [validate, sbom-generation]
+    if: |
+      github.ref == 'refs/heads/develop' || 
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'dev')
+    
+    environment:
+      name: dev
+    
+    outputs:
+      ami_id: ${{ steps.build.outputs.ami_id }}
+      version: ${{ steps.version.outputs.version }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Determine version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="1.0.${GITHUB_RUN_NUMBER}"
+          fi
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "Building version: ${VERSION}"
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_DEV }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Setup Packer
+        uses: hashicorp/setup-packer@main
+        with:
+          version: ${{ env.PACKER_VERSION }}
+      
+      - name: Packer Init
+        working-directory: packer
+        run: packer init golden-image.pkr.hcl
+
+      - name: Build AMI
+        id: build
+        working-directory: packer
+        timeout-minutes: 60
+        run: |
+          set -e
+          packer build \
+            -var "aws_region=${{ env.AWS_REGION }}" \
+            -var "environment=dev" \
+            -var "image_version=${{ steps.version.outputs.version }}" \
+            -var "vpc_id=${{ secrets.VPC_ID_DEV }}" \
+            -var "subnet_id=${{ secrets.SUBNET_ID_DEV }}" \
+            golden-image.pkr.hcl
+
+          [ -f manifest.json ] || { echo "Failed: manifest not found"; exit 1; }
+          AMI_ID=$(jq -r '.builds[-1].artifact_id' manifest.json | cut -d ":" -f2)
+          [ -n "$AMI_ID" ] && [ "$AMI_ID" != "null" ] || { echo "Failed: AMI ID extraction"; exit 1; }
+          echo "ami_id=${AMI_ID}" >> $GITHUB_OUTPUT
+      
+      - name: Tag AMI for testing
+        run: |
+          aws ec2 create-tags \
+            --resources ${{ steps.build.outputs.ami_id }} \
+            --tags Key=TestStatus,Value=Pending Key=GitCommit,Value=${{ github.sha }}
+      
+      - name: Upload manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: packer-manifest-dev
+          path: packer/manifest.json
+          retention-days: 30
+      
+      - name: Generate provenance attestation
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-name: ami-${{ steps.build.outputs.ami_id }}
+          subject-digest: sha256:${{ github.sha }}
+          push-to-registry: false
+
+      - name: Summary
+        run: |
+          echo "### DEV Build" >> $GITHUB_STEP_SUMMARY
+          echo "AMI: ${{ steps.build.outputs.ami_id }}" >> $GITHUB_STEP_SUMMARY
+          echo "Version: ${{ steps.version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+
+  test-dev:
+    name: Test DEV Golden Image
+    runs-on: ubuntu-latest
+    needs: build-dev
+    
+    environment:
+      name: dev
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_DEV }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Launch test instance
+        id: launch
+        run: |
+          INSTANCE_ID=$(aws ec2 run-instances \
+            --image-id ${{ needs.build-dev.outputs.ami_id }} \
+            --instance-type t3.micro \
+            --subnet-id ${{ secrets.SUBNET_ID_DEV }} \
+            --security-group-ids ${{ secrets.SG_ID_DEV }} \
+            --iam-instance-profile Name=${{ secrets.INSTANCE_PROFILE_DEV }} \
+            --metadata-options HttpTokens=required,HttpPutResponseHopLimit=1 \
+            --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=ami-test-${{ github.run_id }}},{Key=Purpose,Value=AMI-Testing}]' \
+            --query 'Instances[0].InstanceId' \
+            --output text)
+          
+          echo "instance_id=${INSTANCE_ID}" >> $GITHUB_OUTPUT
+          echo "Launched test instance: ${INSTANCE_ID}"
+      
+      - name: Wait for instance to be ready
+        run: aws ec2 wait instance-status-ok --instance-ids ${{ steps.launch.outputs.instance_id }}
+      
+      - name: Run validation tests
+        id: tests
+        continue-on-error: false
+        timeout-minutes: 15
+        run: |
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids ${{ steps.launch.outputs.instance_id }} \
+            --document-name "AWS-RunShellScript" \
+            --parameters 'commands=["set -e","docker --version || exit 1","kubectl version --client || exit 1","helm version || exit 1","systemctl is-active docker || exit 1","id node_exporter || exit 1"]' \
+            --output text \
+            --query 'Command.CommandId')
+
+          sleep 15
+
+          STATUS=$(aws ssm get-command-invocation \
+            --command-id ${COMMAND_ID} \
+            --instance-id ${{ steps.launch.outputs.instance_id }} \
+            --query 'Status' \
+            --output text)
+
+          if [ "$STATUS" != "Success" ]; then
+            echo "Tests failed: ${STATUS}"
+            exit 1
+          fi
+      
+      - name: Cleanup test instance
+        if: always()
+        run: aws ec2 terminate-instances --instance-ids ${{ steps.launch.outputs.instance_id }}
+      
+      - name: Update AMI test status
+        run: |
+          aws ec2 create-tags \
+            --resources ${{ needs.build-dev.outputs.ami_id }} \
+            --tags Key=TestStatus,Value=Passed Key=TestDate,Value=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+      
+      - name: Test Summary
+        run: |
+          echo "### DEV Tests Passed" >> $GITHUB_STEP_SUMMARY
+          echo "AMI: ${{ needs.build-dev.outputs.ami_id }}" >> $GITHUB_STEP_SUMMARY
+
+  security-gate-dev:
+    name: Security Gate - DEV
+    runs-on: ubuntu-latest
+    needs: test-dev
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_DEV }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Check security scan status
+        id: security_check
+        continue-on-error: false
+        run: |
+          CRITICAL=$(aws ec2 describe-images \
+            --image-ids ${{ needs.test-dev.outputs.ami_id || needs.build-dev.outputs.ami_id }} \
+            --query 'Images[0].Tags[?Key==`CriticalVulnerabilities`].Value' \
+            --output text 2>/dev/null || echo "0")
+
+          CRITICAL=${CRITICAL:-0}
+          echo "critical_vulns=${CRITICAL}" >> $GITHUB_OUTPUT
+
+          if [ "${CRITICAL}" != "0" ] && [ "${CRITICAL}" != "None" ]; then
+            echo "Failed: ${CRITICAL} critical vulnerabilities"
+            exit 1
+          fi
+
+      - name: Mark as approved for staging
+        run: |
+          aws ec2 create-tags \
+            --resources ${{ needs.build-dev.outputs.ami_id }} \
+            --tags Key=StagingApproved,Value=true Key=ApprovedDate,Value=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+  build-staging:
+    name: Build STAGING Golden Image
+    runs-on: ubuntu-latest
+    needs: [validate, sbom-generation, security-gate-dev]
+    if: |
+      github.ref == 'refs/heads/main' || 
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'staging')
+    
+    environment:
+      name: staging
+    
+    outputs:
+      ami_id: ${{ steps.build.outputs.ami_id }}
+      version: ${{ steps.version.outputs.version }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Determine version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="1.0.${GITHUB_RUN_NUMBER}"
+          fi
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_STAGING }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Setup Packer
+        uses: hashicorp/setup-packer@main
+        with:
+          version: ${{ env.PACKER_VERSION }}
+      
+      - name: Packer Init
+        working-directory: packer
+        run: packer init golden-image.pkr.hcl
+
+      - name: Build STAGING AMI
+        id: build
+        working-directory: packer
+        timeout-minutes: 60
+        run: |
+          set -e
+          packer build \
+            -var "aws_region=${{ env.AWS_REGION }}" \
+            -var "environment=staging" \
+            -var "image_version=${{ steps.version.outputs.version }}" \
+            -var "encrypt_boot=true" \
+            golden-image.pkr.hcl
+
+          [ -f manifest.json ] || { echo "Failed: manifest not found"; exit 1; }
+          AMI_ID=$(jq -r '.builds[-1].artifact_id' manifest.json | cut -d ":" -f2)
+          [ -n "$AMI_ID" ] && [ "$AMI_ID" != "null" ] || { echo "Failed: AMI ID extraction"; exit 1; }
+          echo "ami_id=${AMI_ID}" >> $GITHUB_OUTPUT
+      
+      - name: Upload manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: packer-manifest-staging
+          path: packer/manifest.json
+          retention-days: 90
+      
+      - name: Generate provenance attestation
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-name: ami-${{ steps.build.outputs.ami_id }}
+          subject-digest: sha256:${{ github.sha }}
+          push-to-registry: false
+
+      - name: Summary
+        run: |
+          echo "### STAGING Build" >> $GITHUB_STEP_SUMMARY
+          echo "AMI: ${{ steps.build.outputs.ami_id }}" >> $GITHUB_STEP_SUMMARY
+          echo "Version: ${{ steps.version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+
+  test-staging:
+    name: Test STAGING Golden Image
+    runs-on: ubuntu-latest
+    needs: build-staging
+
+    environment:
+      name: staging
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_STAGING }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Launch test instance
+        id: launch
+        run: |
+          INSTANCE_ID=$(aws ec2 run-instances \
+            --image-id ${{ needs.build-staging.outputs.ami_id }} \
+            --instance-type t3.micro \
+            --subnet-id ${{ secrets.SUBNET_ID_STAGING }} \
+            --security-group-ids ${{ secrets.SG_ID_STAGING }} \
+            --iam-instance-profile Name=${{ secrets.INSTANCE_PROFILE_STAGING }} \
+            --metadata-options HttpTokens=required,HttpPutResponseHopLimit=1 \
+            --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=staging-test-${{ github.run_id }}},{Key=Purpose,Value=Staging-Testing}]' \
+            --query 'Instances[0].InstanceId' \
+            --output text)
+
+          echo "instance_id=${INSTANCE_ID}" >> $GITHUB_OUTPUT
+
+      - name: Wait for instance ready
+        run: |
+          aws ec2 wait instance-status-ok --instance-ids ${{ steps.launch.outputs.instance_id }}
+
+      - name: Run smoke tests
+        timeout-minutes: 10
+        run: |
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids ${{ steps.launch.outputs.instance_id }} \
+            --document-name "AWS-RunShellScript" \
+            --parameters 'commands=["docker --version && kubectl version --client && helm version"]' \
+            --output text \
+            --query 'Command.CommandId')
+
+          sleep 10
+
+          STATUS=$(aws ssm get-command-invocation \
+            --command-id ${COMMAND_ID} \
+            --instance-id ${{ steps.launch.outputs.instance_id }} \
+            --query 'Status' \
+            --output text)
+
+          [ "$STATUS" = "Success" ] || { echo "Smoke tests failed"; exit 1; }
+
+      - name: Cleanup test instance
+        if: always()
+        run: |
+          aws ec2 terminate-instances --instance-ids ${{ steps.launch.outputs.instance_id }}
+
+  security-gate-staging:
+    name: Security Gate - STAGING
+    runs-on: ubuntu-latest
+    needs: test-staging
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_STAGING }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Security validation
+        continue-on-error: false
+        run: |
+          CRITICAL=$(aws ec2 describe-images \
+            --image-ids ${{ needs.build-staging.outputs.ami_id }} \
+            --query 'Images[0].Tags[?Key==`CriticalVulnerabilities`].Value' \
+            --output text 2>/dev/null || echo "0")
+
+          CRITICAL=${CRITICAL:-0}
+
+          if [ "${CRITICAL}" != "0" ] && [ "${CRITICAL}" != "None" ]; then
+            echo "Failed: ${CRITICAL} critical vulnerabilities"
+            exit 1
+          fi
+
+      - name: Mark as approved for production
+        run: |
+          aws ec2 create-tags \
+            --resources ${{ needs.build-staging.outputs.ami_id }} \
+            --tags Key=ProductionApproved,Value=true Key=ApprovedDate,Value=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+  build-production:
+    name: Build PRODUCTION Golden Image
+    runs-on: ubuntu-latest
+    needs: [build-staging, security-gate-staging]
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production'
+    
+    environment:
+      name: production
+      url: https://console.aws.amazon.com
+    
+    outputs:
+      ami_id: ${{ steps.build.outputs.ami_id }}
+      version: ${{ steps.version.outputs.version }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Production deployment gate
+        run: |
+          echo "⚠️  PRODUCTION DEPLOYMENT"
+          echo "This will create a production golden image."
+          echo "Ensure all approvals are in place."
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Setup Packer
+        uses: hashicorp/setup-packer@main
+        with:
+          version: ${{ env.PACKER_VERSION }}
+      
+      - name: Packer Init
+        working-directory: packer
+        run: packer init golden-image.pkr.hcl
+
+      - name: Build PRODUCTION AMI
+        id: build
+        working-directory: packer
+        timeout-minutes: 60
+        run: |
+          set -e
+          packer build \
+            -var "aws_region=${{ env.AWS_REGION }}" \
+            -var "environment=production" \
+            -var "image_version=${{ github.event.inputs.version }}" \
+            -var "encrypt_boot=true" \
+            -var "kms_key_id=${{ secrets.KMS_KEY_ID_PROD }}" \
+            golden-image.pkr.hcl
+
+          [ -f manifest.json ] || { echo "Failed: manifest not found"; exit 1; }
+          AMI_ID=$(jq -r '.builds[-1].artifact_id' manifest.json | cut -d ":" -f2)
+          [ -n "$AMI_ID" ] && [ "$AMI_ID" != "null" ] || { echo "Failed: AMI ID extraction"; exit 1; }
+          echo "ami_id=${AMI_ID}" >> $GITHUB_OUTPUT
+      
+      - name: Tag production AMI
+        run: |
+          aws ec2 create-tags \
+            --resources ${{ steps.build.outputs.ami_id }} \
+            --tags \
+              Key=Production,Value=true \
+              Key=Approved,Value=true \
+              Key=ApprovedBy,Value=${{ github.actor }} \
+              Key=ApprovalDate,Value=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+      
+      - name: Share AMI across accounts (optional)
+        if: vars.SHARE_AMI_ACCOUNTS != ''
+        run: |
+          aws ec2 modify-image-attribute \
+            --image-id ${{ steps.build.outputs.ami_id }} \
+            --launch-permission "Add=[{UserId=${{ vars.SHARE_AMI_ACCOUNTS }}}]"
+      
+      - name: Upload manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: packer-manifest-production
+          path: packer/manifest.json
+          retention-days: 365
+      
+      - name: Create release notes
+        run: |
+          cat << EOF > release-notes.md
+          # Golden Image Release - v${{ github.event.inputs.version }}
+          
+          ## Production AMI Details
+          - **AMI ID:** ${{ steps.build.outputs.ami_id }}
+          - **Region:** ${{ env.AWS_REGION }}
+          - **Version:** ${{ github.event.inputs.version }}
+          - **Build Date:** $(date -u +%Y-%m-%dT%H:%M:%SZ)
+          - **Approved By:** ${{ github.actor }}
+          
+          ## Included Components
+          - Ubuntu 22.04 LTS (latest patches)
+          - Docker and containerd
+          - Kubernetes tools (kubectl, kubeadm, kubelet)
+          - Helm
+          - Fluent Bit
+          - SSSD/Realmd (AD integration)
+          - Certbot (HTTPS)
+          
+          ## Zero-Identity Compliance
+          - SSH host keys removed
+          - Machine-ID cleared
+          - User histories removed
+          - Cloud-init data cleared
+          
+          ## Deployment
+          This image is ready for production use.
+          EOF
+          
+          cat release-notes.md
+      
+      - name: Upload release notes
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-notes-v${{ github.event.inputs.version }}
+          path: release-notes.md
+          retention-days: 365
+      
+      - name: Generate provenance attestation
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-name: ami-${{ steps.build.outputs.ami_id }}
+          subject-digest: sha256:${{ github.sha }}
+          push-to-registry: false
+
+      - name: Production Summary
+        run: |
+          echo "### Production Deployment" >> $GITHUB_STEP_SUMMARY
+          echo "AMI: ${{ steps.build.outputs.ami_id }}" >> $GITHUB_STEP_SUMMARY
+          echo "Version: ${{ github.event.inputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "Approved: ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+
+      - name: Notify team
+        if: vars.SLACK_WEBHOOK_URL != ''
+        run: |
+          curl -X POST ${{ vars.SLACK_WEBHOOK_URL }} \
+            -H 'Content-Type: application/json' \
+            -d '{
+              "text": "Production Golden Image Deployed",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Production Golden Image v${{ github.event.inputs.version }}*\nAMI: `${{ steps.build.outputs.ami_id }}`\nApproved by: ${{ github.actor }}"
+                  }
+                }
+              ]
+            }'
+
+  verify-production:
+    name: Verify Production Deployment
+    runs-on: ubuntu-latest
+    needs: build-production
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production'
+
+    environment:
+      name: production
+
+    steps:
+      - name: Configure AWS credentials
+        uses: actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify AMI availability
+        run: |
+          AMI_STATE=$(aws ec2 describe-images \
+            --image-ids ${{ needs.build-production.outputs.ami_id }} \
+            --query 'Images[0].State' \
+            --output text)
+
+          [ "$AMI_STATE" = "available" ] || { echo "Failed: AMI not available"; exit 1; }
+
+      - name: Verify encryption
+        run: |
+          ENCRYPTED=$(aws ec2 describe-images \
+            --image-ids ${{ needs.build-production.outputs.ami_id }} \
+            --query 'Images[0].BlockDeviceMappings[0].Ebs.Encrypted' \
+            --output text)
+
+          [ "$ENCRYPTED" = "true" ] || { echo "Failed: AMI not encrypted"; exit 1; }
+
+      - name: Verify tags
+        run: |
+          TAGS=$(aws ec2 describe-images \
+            --image-ids ${{ needs.build-production.outputs.ami_id }} \
+            --query 'Images[0].Tags[?Key==`Production`].Value' \
+            --output text)
+
+          [ "$TAGS" = "true" ] || { echo "Failed: production tag missing"; exit 1; }

@@ -1,0 +1,318 @@
+name: Security Scanning
+
+on:
+  workflow_run:
+    workflows: ["Golden Image CI/CD Pipeline"]
+    types:
+      - completed
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      ami_id:
+        description: 'AMI ID to scan (leave empty to scan latest)'
+        required: false
+        type: string
+      environment:
+        description: 'Environment to scan'
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - production
+
+env:
+  AWS_REGION: 'us-east-1'
+
+permissions:
+  contents: read
+  id-token: write
+  security-events: write
+  issues: write
+
+jobs:
+  vulnerability-scan:
+    name: Scan AMI for Vulnerabilities
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Determine environment and AMI
+        id: determine
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            ENVIRONMENT="${{ github.event.inputs.environment }}"
+            AMI_ID="${{ github.event.inputs.ami_id }}"
+          else
+            ENVIRONMENT="dev"
+            AMI_ID=""
+          fi
+
+          echo "environment=${ENVIRONMENT}" >> $GITHUB_OUTPUT
+          echo "ami_id=${AMI_ID}" >> $GITHUB_OUTPUT
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets[format('AWS_ROLE_ARN_{0}', upper(steps.determine.outputs.environment))] }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get latest AMI if not specified
+        id: get_ami
+        run: |
+          if [ -z "${{ steps.determine.outputs.ami_id }}" ]; then
+            AMI_ID=$(aws ec2 describe-images \
+              --owners self \
+              --filters "Name=tag:Environment,Values=${{ steps.determine.outputs.environment }}" \
+              --query 'sort_by(Images, &CreationDate)[-1].ImageId' \
+              --output text)
+          else
+            AMI_ID="${{ steps.determine.outputs.ami_id }}"
+          fi
+
+          echo "ami_id=${AMI_ID}" >> $GITHUB_OUTPUT
+          echo "Scanning AMI: ${AMI_ID}"
+
+      - name: Launch temporary instance for scanning
+        id: launch
+        run: |
+          INSTANCE_ID=$(aws ec2 run-instances \
+            --image-id ${{ steps.get_ami.outputs.ami_id }} \
+            --instance-type t3.micro \
+            --subnet-id ${{ secrets[format('SUBNET_ID_{0}', upper(steps.determine.outputs.environment))] }} \
+            --security-group-ids ${{ secrets[format('SG_ID_{0}', upper(steps.determine.outputs.environment))] }} \
+            --metadata-options HttpTokens=required,HttpPutResponseHopLimit=1 \
+            --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=security-scan-${{ github.run_id }}},{Key=Purpose,Value=Security-Scanning}]' \
+            --query 'Instances[0].InstanceId' \
+            --output text)
+
+          echo "instance_id=${INSTANCE_ID}" >> $GITHUB_OUTPUT
+          echo "Launched instance: ${INSTANCE_ID}"
+
+      - name: Wait for instance to be ready
+        run: |
+          aws ec2 wait instance-status-ok --instance-ids ${{ steps.launch.outputs.instance_id }}
+          sleep 30
+
+      - name: Run Trivy vulnerability scan via SSM
+        id: trivy_scan
+        timeout-minutes: 20
+        continue-on-error: true
+        run: |
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids ${{ steps.launch.outputs.instance_id }} \
+            --document-name "AWS-RunShellScript" \
+            --timeout-seconds 600 \
+            --parameters 'commands=[
+              "set -e",
+              "export DEBIAN_FRONTEND=noninteractive",
+              "sudo apt-get update -qq",
+              "sudo apt-get install -y -qq wget gnupg",
+              "wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo gpg --dearmor -o /usr/share/keyrings/trivy.gpg",
+              "echo \"deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main\" | sudo tee /etc/apt/sources.list.d/trivy.list",
+              "sudo apt-get update -qq",
+              "sudo apt-get install -y -qq trivy",
+              "trivy rootfs --format json --output /tmp/trivy-report.json / || true",
+              "trivy rootfs --severity HIGH,CRITICAL / || true"
+            ]' \
+            --output text \
+            --query 'Command.CommandId')
+
+          echo "command_id=${COMMAND_ID}" >> $GITHUB_OUTPUT
+          sleep 90
+
+          STATUS="Pending"
+          for i in {1..10}; do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id ${COMMAND_ID} \
+              --instance-id ${{ steps.launch.outputs.instance_id }} \
+              --query 'Status' \
+              --output text 2>/dev/null || echo "Pending")
+
+            if [ "$STATUS" = "Success" ] || [ "$STATUS" = "Failed" ]; then
+              break
+            fi
+            sleep 10
+          done
+
+          OUTPUT=$(aws ssm get-command-invocation \
+            --command-id ${COMMAND_ID} \
+            --instance-id ${{ steps.launch.outputs.instance_id }} \
+            --query 'StandardOutputContent' \
+            --output text 2>/dev/null || echo "No output available")
+
+          echo "$OUTPUT" > trivy-output.txt
+          cat trivy-output.txt
+
+      - name: Run CIS benchmark audit via SSM
+        id: cis_audit
+        timeout-minutes: 15
+        continue-on-error: true
+        run: |
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids ${{ steps.launch.outputs.instance_id }} \
+            --document-name "AWS-RunShellScript" \
+            --timeout-seconds 300 \
+            --parameters 'commands=[
+              "sudo lynis audit system --quick --quiet || true",
+              "sudo cat /var/log/lynis.log || echo \"No lynis log found\""
+            ]' \
+            --output text \
+            --query 'Command.CommandId')
+
+          sleep 60
+
+          STATUS="Pending"
+          for i in {1..6}; do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id ${COMMAND_ID} \
+              --instance-id ${{ steps.launch.outputs.instance_id }} \
+              --query 'Status' \
+              --output text 2>/dev/null || echo "Pending")
+
+            if [ "$STATUS" = "Success" ] || [ "$STATUS" = "Failed" ]; then
+              break
+            fi
+            sleep 10
+          done
+
+          OUTPUT=$(aws ssm get-command-invocation \
+            --command-id ${COMMAND_ID} \
+            --instance-id ${{ steps.launch.outputs.instance_id }} \
+            --query 'StandardOutputContent' \
+            --output text 2>/dev/null || echo "No output available")
+
+          echo "$OUTPUT" > lynis-audit.txt
+          cat lynis-audit.txt
+
+      - name: Check for rootkits via SSM
+        timeout-minutes: 10
+        continue-on-error: true
+        run: |
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids ${{ steps.launch.outputs.instance_id }} \
+            --document-name "AWS-RunShellScript" \
+            --timeout-seconds 180 \
+            --parameters 'commands=[
+              "sudo rkhunter --update || true",
+              "sudo rkhunter --check --skip-keypress --report-warnings-only || true"
+            ]' \
+            --output text \
+            --query 'Command.CommandId')
+
+          sleep 45
+
+          STATUS="Pending"
+          for i in {1..5}; do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id ${COMMAND_ID} \
+              --instance-id ${{ steps.launch.outputs.instance_id }} \
+              --query 'Status' \
+              --output text 2>/dev/null || echo "Pending")
+
+            if [ "$STATUS" = "Success" ] || [ "$STATUS" = "Failed" ]; then
+              break
+            fi
+            sleep 10
+          done
+
+          OUTPUT=$(aws ssm get-command-invocation \
+            --command-id ${COMMAND_ID} \
+            --instance-id ${{ steps.launch.outputs.instance_id }} \
+            --query 'StandardOutputContent' \
+            --output text 2>/dev/null || echo "No output available")
+
+          echo "$OUTPUT" > rkhunter-output.txt
+          cat rkhunter-output.txt
+
+      - name: Terminate scanning instance
+        if: always()
+        run: |
+          aws ec2 terminate-instances --instance-ids ${{ steps.launch.outputs.instance_id }}
+
+      - name: Upload scan results
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-scan-results-${{ github.run_id }}
+          path: |
+            trivy-output.txt
+            lynis-audit.txt
+            rkhunter-output.txt
+          retention-days: 90
+
+      - name: Analyze scan results
+        id: analyze
+        run: |
+          CRITICAL_COUNT=0
+          HIGH_COUNT=0
+
+          if [ -f trivy-output.txt ]; then
+            CRITICAL_COUNT=$(grep -c "CRITICAL" trivy-output.txt 2>/dev/null || echo "0")
+            HIGH_COUNT=$(grep -c "HIGH" trivy-output.txt 2>/dev/null || echo "0")
+          fi
+
+          echo "critical_count=${CRITICAL_COUNT}" >> $GITHUB_OUTPUT
+          echo "high_count=${HIGH_COUNT}" >> $GITHUB_OUTPUT
+
+      - name: Tag AMI with scan results
+        run: |
+          aws ec2 create-tags \
+            --resources ${{ steps.get_ami.outputs.ami_id }} \
+            --tags \
+              Key=SecurityScanDate,Value=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+              Key=CriticalVulnerabilities,Value=${{ steps.analyze.outputs.critical_count }} \
+              Key=HighVulnerabilities,Value=${{ steps.analyze.outputs.high_count }} \
+              Key=LastScannedBy,Value=GitHub-Actions
+
+      - name: Create security issue if vulnerabilities found
+        if: steps.analyze.outputs.critical_count > 0
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `[SECURITY] Critical vulnerabilities found in AMI ${{ steps.get_ami.outputs.ami_id }}`,
+              body: `## Security Scan Alert
+
+              **AMI ID:** ${{ steps.get_ami.outputs.ami_id }}
+              **Environment:** ${{ steps.determine.outputs.environment }}
+              **Scan Date:** ${new Date().toISOString()}
+
+              ### Vulnerability Summary
+              - **Critical:** ${{ steps.analyze.outputs.critical_count }}
+              - **High:** ${{ steps.analyze.outputs.high_count }}
+
+              ### Action Required
+              Critical vulnerabilities have been detected. Please review the scan results and:
+              1. Assess the impact of identified vulnerabilities
+              2. Update affected packages
+              3. Rebuild the golden image
+              4. Re-scan to verify fixes
+
+              **Scan Results:** Download artifacts from workflow run ${{ github.run_id }}
+              `,
+              labels: ['security', 'vulnerability', 'high-priority', `env:${{ steps.determine.outputs.environment }}`]
+            });
+
+      - name: Fail if critical vulnerabilities found
+        if: steps.analyze.outputs.critical_count > 0 && steps.determine.outputs.environment == 'production'
+        run: |
+          echo "Failed: critical vulnerabilities in production AMI"
+          exit 1
+
+      - name: Security scan summary
+        run: |
+          echo "### Security Scan" >> $GITHUB_STEP_SUMMARY
+          echo "AMI: ${{ steps.get_ami.outputs.ami_id }}" >> $GITHUB_STEP_SUMMARY
+          echo "Critical: ${{ steps.analyze.outputs.critical_count }}" >> $GITHUB_STEP_SUMMARY
+          echo "High: ${{ steps.analyze.outputs.high_count }}" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ steps.analyze.outputs.critical_count }}" -ne "0" ]; then
+            echo "Status: Failed" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "Status: Passed" >> $GITHUB_STEP_SUMMARY
+          fi

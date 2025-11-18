@@ -1,0 +1,145 @@
+---
+- name: Include version variables
+  ansible.builtin.include_vars:
+    file: "{{ playbook_dir }}/roles/k8s_prereqs/vars/main.yml"
+
+- name: Set OS-specific facts
+  ansible.builtin.set_fact:
+    os_codename: "{{ os_codename | default(ansible_distribution_release) }}"
+    os_version_clean: "{{ os_version | default(ansible_distribution_version) | replace('.', '') }}"
+    docker_version_dynamic: "{{ docker_version | regex_replace('jammy', os_codename) }}"
+
+- name: Remove old Docker versions if present
+  ansible.builtin.apt:
+    name:
+      - docker
+      - docker-engine
+      - docker.io
+      - containerd
+      - runc
+    state: absent
+  become: yes
+
+- name: Install Docker prerequisites
+  ansible.builtin.apt:
+    name:
+      - apt-transport-https
+      - ca-certificates
+      - curl
+      - gnupg
+      - lsb-release
+    state: present
+  become: yes
+
+- name: Add Docker GPG key
+  ansible.builtin.apt_key:
+    url: https://download.docker.com/linux/ubuntu/gpg
+    state: present
+    keyring: /usr/share/keyrings/docker-archive-keyring.gpg
+  become: yes
+
+- name: Add Docker repository
+  ansible.builtin.apt_repository:
+    repo: "deb [arch=amd64 signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+    state: present
+    filename: docker
+    update_cache: yes
+  become: yes
+
+- name: Install Docker Engine and containerd
+  ansible.builtin.apt:
+    name:
+      - docker-ce={{ docker_version_dynamic }}
+      - docker-ce-cli={{ docker_version_dynamic }}
+      - containerd.io
+      - docker-buildx-plugin
+      - docker-compose-plugin
+    state: present
+    allow_downgrade: yes
+  become: yes
+
+- name: Create Docker daemon configuration directory
+  ansible.builtin.file:
+    path: /etc/docker
+    state: directory
+    mode: '0755'
+  become: yes
+
+- name: Configure Docker daemon for production use
+  ansible.builtin.copy:
+    content: |
+      {
+        "exec-opts": ["native.cgroupdriver=systemd"],
+        "log-driver": "json-file",
+        "log-opts": {
+          "max-size": "100m",
+          "max-file": "3"
+        },
+        "storage-driver": "overlay2",
+        "live-restore": true,
+        "userland-proxy": false,
+        "metrics-addr": "0.0.0.0:9323",
+        "experimental": false
+      }
+    dest: /etc/docker/daemon.json
+    mode: '0644'
+  become: yes
+
+- name: Create systemd drop-in directory for Docker
+  ansible.builtin.file:
+    path: /etc/systemd/system/docker.service.d
+    state: directory
+    mode: '0755'
+  become: yes
+
+- name: Reload systemd daemon
+  ansible.builtin.systemd:
+    daemon_reload: yes
+  become: yes
+
+- name: Enable and start Docker service
+  ansible.builtin.systemd:
+    name: docker
+    enabled: yes
+    state: started
+  become: yes
+
+- name: Configure containerd for Kubernetes
+  ansible.builtin.shell: |
+    mkdir -p /etc/containerd
+    containerd config default | tee /etc/containerd/config.toml
+    sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+  become: yes
+  args:
+    executable: /bin/bash
+    creates: /etc/containerd/config.toml
+
+- name: Restart containerd service
+  ansible.builtin.systemd:
+    name: containerd
+    state: restarted
+    enabled: yes
+  become: yes
+
+- name: Add ubuntu user to docker group
+  ansible.builtin.user:
+    name: ubuntu
+    groups: docker
+    append: yes
+  become: yes
+
+- name: Install Docker Compose standalone
+  ansible.builtin.get_url:
+    url: "https://github.com/docker/compose/releases/download/v{{ docker_compose_version }}/docker-compose-linux-x86_64"
+    dest: /usr/local/bin/docker-compose
+    mode: '0755'
+  become: yes
+
+- name: Verify Docker installation
+  ansible.builtin.command: docker --version
+  register: docker_version_output
+  changed_when: false
+
+- name: Display Docker version
+  ansible.builtin.debug:
+    msg: "Installed Docker version: {{ docker_version_output.stdout }}"

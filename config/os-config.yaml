@@ -1,0 +1,25 @@
+---
+os_distribution: ubuntu
+os_version: "22.04"
+os_codename: jammy
+os_arch: amd64
+
+ami_owner: "099720109477"
+
+ami_name_filter: "ubuntu/images/hvm-ssd/ubuntu-{{ os_codename }}-{{ os_version }}-{{ os_arch }}-server-*"
+
+packer_file_name: "ubuntu-{{ os_version }}.pkr.hcl"
+
+image_name_prefix: "ubuntu-{{ os_version | replace('.', '') }}-golden"
+
+supported_versions:
+  ubuntu:
+    - version: "22.04"
+      codename: jammy
+      ami_owner: "099720109477"
+    - version: "24.04"
+      codename: noble
+      ami_owner: "099720109477"
+    - version: "20.04"
+      codename: focal
+      ami_owner: "099720109477"

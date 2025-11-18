@@ -1,0 +1,290 @@
+---
+- name: Include version variables
+  ansible.builtin.include_vars:
+    file: "{{ playbook_dir }}/roles/k8s_prereqs/vars/main.yml"
+
+- name: Install Fluent Bit prerequisites
+  ansible.builtin.apt:
+    name:
+      - wget
+      - gnupg
+      - lsb-release
+    state: present
+  become: yes
+
+- name: Add Fluent Bit GPG key
+  ansible.builtin.apt_key:
+    url: https://packages.fluentbit.io/fluentbit.key
+    state: present
+  become: yes
+
+- name: Add Fluent Bit repository
+  ansible.builtin.apt_repository:
+    repo: "deb https://packages.fluentbit.io/ubuntu/{{ ansible_distribution_release }} {{ ansible_distribution_release }} main"
+    state: present
+    filename: fluent-bit
+    update_cache: yes
+  become: yes
+
+- name: Install Fluent Bit
+  ansible.builtin.apt:
+    name: fluent-bit
+    state: present
+  become: yes
+
+- name: Create Fluent Bit configuration directory
+  ansible.builtin.file:
+    path: /etc/fluent-bit
+    state: directory
+    mode: '0755'
+  become: yes
+
+- name: Create Fluent Bit parsers directory
+  ansible.builtin.file:
+    path: /etc/fluent-bit/parsers
+    state: directory
+    mode: '0755'
+  become: yes
+
+- name: Configure Fluent Bit main configuration
+  ansible.builtin.copy:
+    content: |
+      [SERVICE]
+          Daemon       Off
+          Flush        5
+          Log_Level    info
+          Parsers_File parsers.conf
+          Parsers_File /etc/fluent-bit/parsers/custom_parsers.conf
+          HTTP_Server  On
+          HTTP_Listen  0.0.0.0
+          HTTP_Port    2020
+          storage.path /var/log/flb-storage/
+          storage.sync normal
+          storage.checksum off
+          storage.max_chunks_up 128
+          storage.backlog.mem_limit 5M
+
+      [INPUT]
+          Name         systemd
+          Tag          host.*
+          Read_From_Tail On
+          Strip_Underscores On
+
+      [INPUT]
+          Name         tail
+          Path         /var/log/syslog
+          Tag          syslog
+          Parser       syslog
+          DB           /var/log/flb_syslog.db
+          Mem_Buf_Limit 5MB
+          Skip_Long_Lines On
+          Refresh_Interval 10
+
+      [INPUT]
+          Name         tail
+          Path         /var/log/auth.log
+          Tag          auth
+          Parser       syslog
+          DB           /var/log/flb_auth.db
+          Mem_Buf_Limit 5MB
+
+      [FILTER]
+          Name         modify
+          Match        *
+          Add          hostname ${HOSTNAME}
+
+      [OUTPUT]
+          Name         stdout
+          Match        *
+          Format       json_lines
+    dest: /etc/fluent-bit/fluent-bit.conf
+    mode: '0644'
+  become: yes
+
+- name: Create custom parsers configuration
+  ansible.builtin.copy:
+    content: |
+      [PARSER]
+          Name         docker
+          Format       json
+          Time_Key     time
+          Time_Format  %Y-%m-%dT%H:%M:%S.%L
+          Time_Keep    On
+
+      [PARSER]
+          Name         syslog
+          Format       regex
+          Regex        ^\<(?<pri>[0-9]+)\>(?<time>[^ ]* {1,2}[^ ]* [^ ]*) (?<host>[^ ]*) (?<ident>[a-zA-Z0-9_\/\.\-]*)(?:\[(?<pid>[0-9]+)\])?(?:[^\:]*\:)? *(?<message>.*)$
+          Time_Key     time
+          Time_Format  %b %d %H:%M:%S
+          Time_Keep    Off
+
+      [PARSER]
+          Name         kube
+          Format       regex
+          Regex        ^(?<time>[^ ]+) (?<stream>stdout|stderr) (?<logtag>[^ ]*) (?<log>.*)$
+          Time_Key     time
+          Time_Format  %Y-%m-%dT%H:%M:%S.%L%z
+          Time_Keep    On
+    dest: /etc/fluent-bit/parsers/custom_parsers.conf
+    mode: '0644'
+  become: yes
+
+- name: Create Fluent Bit storage directory
+  ansible.builtin.file:
+    path: /var/log/flb-storage
+    state: directory
+    mode: '0755'
+  become: yes
+
+- name: Enable Fluent Bit service (but don't start until configured)
+  ansible.builtin.systemd:
+    name: fluent-bit
+    enabled: yes
+    state: stopped
+  become: yes
+
+- name: Create systemd override directory for Fluent Bit
+  ansible.builtin.file:
+    path: /etc/systemd/system/fluent-bit.service.d
+    state: directory
+    mode: '0755'
+  become: yes
+
+- name: Configure Fluent Bit systemd override
+  ansible.builtin.copy:
+    content: |
+      [Service]
+      Restart=always
+      RestartSec=10s
+      LimitNOFILE=65536
+    dest: /etc/systemd/system/fluent-bit.service.d/override.conf
+    mode: '0644'
+  become: yes
+
+- name: Reload systemd daemon
+  ansible.builtin.systemd:
+    daemon_reload: yes
+  become: yes
+
+- name: Verify Fluent Bit installation
+  ansible.builtin.command: fluent-bit --version
+  register: fluentbit_version_output
+  changed_when: false
+
+- name: Display Fluent Bit version
+  ansible.builtin.debug:
+    msg: "Installed Fluent Bit version: {{ fluentbit_version_output.stdout }}"
+
+- name: Create Fluent Bit configuration validation script
+  ansible.builtin.copy:
+    content: |
+      #!/bin/bash
+      fluent-bit -c /etc/fluent-bit/fluent-bit.conf --dry-run
+    dest: /usr/local/bin/validate-fluentbit
+    mode: '0755'
+  become: yes
+
+- name: Create Prometheus node_exporter user
+  ansible.builtin.user:
+    name: node_exporter
+    system: yes
+    shell: /bin/false
+    createhome: no
+  become: yes
+
+- name: Download Prometheus Node Exporter
+  ansible.builtin.get_url:
+    url: "https://github.com/prometheus/node_exporter/releases/download/v{{ node_exporter_version }}/node_exporter-{{ node_exporter_version }}.linux-amd64.tar.gz"
+    dest: "/tmp/node_exporter-{{ node_exporter_version }}.linux-amd64.tar.gz"
+    mode: '0644'
+  become: yes
+
+- name: Extract Node Exporter
+  ansible.builtin.unarchive:
+    src: "/tmp/node_exporter-{{ node_exporter_version }}.linux-amd64.tar.gz"
+    dest: /tmp
+    remote_src: yes
+  become: yes
+
+- name: Copy Node Exporter binary
+  ansible.builtin.copy:
+    src: "/tmp/node_exporter-{{ node_exporter_version }}.linux-amd64/node_exporter"
+    dest: /usr/local/bin/node_exporter
+    mode: '0755'
+    owner: node_exporter
+    group: node_exporter
+    remote_src: yes
+  become: yes
+
+- name: Create Node Exporter systemd service
+  ansible.builtin.copy:
+    content: |
+      [Unit]
+      Description=Prometheus Node Exporter
+      Documentation=https://github.com/prometheus/node_exporter
+      Wants=network-online.target
+      After=network-online.target
+
+      [Service]
+      Type=simple
+      User=node_exporter
+      Group=node_exporter
+      ExecStart=/usr/local/bin/node_exporter \
+        --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|var/lib/docker/.+|var/lib/kubelet/.+)($|/) \
+        --collector.netclass.ignored-devices=^(veth.*|docker.*|br-.*|cali.*|flannel.*)$ \
+        --collector.netdev.device-exclude=^(veth.*|docker.*|br-.*|cali.*|flannel.*)$ \
+        --collector.processes \
+        --collector.systemd \
+        --collector.tcpstat \
+        --web.listen-address=:9100
+
+      SyslogIdentifier=node_exporter
+      Restart=always
+      RestartSec=5
+
+      [Install]
+      WantedBy=multi-user.target
+    dest: /etc/systemd/system/node_exporter.service
+    mode: '0644'
+  become: yes
+
+- name: Reload systemd daemon for node_exporter
+  ansible.builtin.systemd:
+    daemon_reload: yes
+  become: yes
+
+- name: Enable and start Node Exporter
+  ansible.builtin.systemd:
+    name: node_exporter
+    enabled: yes
+    state: started
+  become: yes
+
+- name: Cleanup Node Exporter installation files
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "/tmp/node_exporter-{{ node_exporter_version }}.linux-amd64.tar.gz"
+    - "/tmp/node_exporter-{{ node_exporter_version }}.linux-amd64"
+  become: yes
+
+- name: Verify Node Exporter is running
+  ansible.builtin.uri:
+    url: http://localhost:9100/metrics
+    return_content: no
+    status_code: 200
+  register: node_exporter_health
+  retries: 3
+  delay: 5
+  until: node_exporter_health.status == 200
+
+- name: Display observability summary
+  ansible.builtin.debug:
+    msg:
+      - "Observability stack installed successfully"
+      - "Fluent Bit: {{ fluentbit_version_output.stdout }}"
+      - "Prometheus Node Exporter: {{ node_exporter_version }} (port 9100)"
+      - "Fluent Bit HTTP endpoint: http://localhost:2020"
+      - "Node Exporter metrics: http://localhost:9100/metrics"

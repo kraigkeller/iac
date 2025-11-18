@@ -1,0 +1,135 @@
+---
+- name: Include version variables
+  ansible.builtin.include_vars:
+    file: "{{ playbook_dir }}/roles/k8s_prereqs/vars/main.yml"
+
+- name: Install Kubernetes prerequisites
+  ansible.builtin.apt:
+    name:
+      - apt-transport-https
+      - ca-certificates
+      - curl
+      - gpg
+    state: present
+  become: yes
+
+- name: Create keyrings directory
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: '0755'
+  become: yes
+
+- name: Add Kubernetes GPG key
+  ansible.builtin.shell: |
+    curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.28/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+  become: yes
+  args:
+    creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+    executable: /bin/bash
+
+- name: Add Kubernetes repository
+  ansible.builtin.apt_repository:
+    repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.28/deb/ /"
+    state: present
+    filename: kubernetes
+    update_cache: yes
+  become: yes
+
+- name: Install kubelet, kubeadm, and kubectl
+  ansible.builtin.apt:
+    name:
+      - kubelet={{ kubelet_version }}
+      - kubeadm={{ kubeadm_version }}
+      - kubectl={{ kubectl_version }}
+    state: present
+    allow_downgrade: yes
+  become: yes
+
+- name: Hold Kubernetes packages at current version
+  ansible.builtin.dpkg_selections:
+    name: "{{ item }}"
+    selection: hold
+  loop:
+    - kubelet
+    - kubeadm
+    - kubectl
+  become: yes
+
+- name: Enable kubelet service (will start on kubeadm init)
+  ansible.builtin.systemd:
+    name: kubelet
+    enabled: yes
+  become: yes
+
+- name: Create kubectl configuration directory for ubuntu user
+  ansible.builtin.file:
+    path: /home/ubuntu/.kube
+    state: directory
+    owner: ubuntu
+    group: ubuntu
+    mode: '0755'
+  become: yes
+
+- name: Download Helm installation script
+  ansible.builtin.get_url:
+    url: https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+    dest: /tmp/get_helm.sh
+    mode: '0700'
+  become: yes
+
+- name: Install Helm
+  ansible.builtin.shell: |
+    export DESIRED_VERSION=v{{ helm_version }}
+    /tmp/get_helm.sh
+  become: yes
+  args:
+    executable: /bin/bash
+    creates: /usr/local/bin/helm
+
+- name: Verify kubectl installation
+  ansible.builtin.command: kubectl version --client
+  register: kubectl_version_output
+  changed_when: false
+
+- name: Verify kubeadm installation
+  ansible.builtin.command: kubeadm version
+  register: kubeadm_version_output
+  changed_when: false
+
+- name: Verify Helm installation
+  ansible.builtin.command: helm version
+  register: helm_version_output
+  changed_when: false
+
+- name: Display installed versions
+  ansible.builtin.debug:
+    msg:
+      - "kubectl: {{ kubectl_version_output.stdout }}"
+      - "kubeadm: {{ kubeadm_version_output.stdout }}"
+      - "helm: {{ helm_version_output.stdout }}"
+
+- name: Install bash completion for kubectl
+  ansible.builtin.shell: |
+    kubectl completion bash | tee /etc/bash_completion.d/kubectl > /dev/null
+  become: yes
+  args:
+    creates: /etc/bash_completion.d/kubectl
+    executable: /bin/bash
+
+- name: Install bash completion for helm
+  ansible.builtin.shell: |
+    helm completion bash | tee /etc/bash_completion.d/helm > /dev/null
+  become: yes
+  args:
+    creates: /etc/bash_completion.d/helm
+    executable: /bin/bash
+
+- name: Create kubectl alias for convenience
+  ansible.builtin.lineinfile:
+    path: /home/ubuntu/.bashrc
+    line: "alias k=kubectl"
+    create: yes
+    owner: ubuntu
+    group: ubuntu
+  become: yes

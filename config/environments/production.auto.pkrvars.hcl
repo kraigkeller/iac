@@ -1,0 +1,10 @@
+environment      = "production"
+aws_region       = "us-east-1"
+os_distribution  = "ubuntu"
+os_version       = "22.04"
+os_codename      = "jammy"
+os_arch          = "amd64"
+source_ami_owner = "099720109477"
+instance_type    = "t3.large"
+encrypt_boot     = true
+volume_size      = 50

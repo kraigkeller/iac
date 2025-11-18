@@ -1,0 +1,4 @@
+---
+vault_version: "1.15.4-1"
+clamav_version: "latest"
+lynis_version: "latest"

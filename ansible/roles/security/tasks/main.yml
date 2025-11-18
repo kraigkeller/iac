@@ -1,0 +1,257 @@
+---
+- name: Include version variables
+  ansible.builtin.include_vars:
+    file: "{{ playbook_dir }}/roles/security/vars/main.yml"
+
+- name: Install security baseline packages
+  ansible.builtin.apt:
+    name:
+      - apparmor
+      - apparmor-utils
+      - apparmor-profiles
+      - apparmor-profiles-extra
+      - auditd
+      - audispd-plugins
+      - fail2ban
+      - aide
+      - aide-common
+      - unattended-upgrades
+      - apt-listchanges
+    state: present
+  become: yes
+
+- name: Enable and start AppArmor service
+  ansible.builtin.systemd:
+    name: apparmor
+    enabled: yes
+    state: started
+  become: yes
+
+- name: Set all AppArmor profiles to enforce mode
+  ansible.builtin.shell: |
+    aa-enforce /etc/apparmor.d/*
+  become: yes
+  ignore_errors: yes
+  args:
+    executable: /bin/bash
+
+- name: Configure auditd rules for security monitoring
+  ansible.builtin.copy:
+    content: |
+      -w /etc/passwd -p wa -k identity
+      -w /etc/group -p wa -k identity
+      -w /etc/shadow -p wa -k identity
+      -w /etc/sudoers -p wa -k sudoers
+      -w /etc/sudoers.d/ -p wa -k sudoers
+      -w /var/log/auth.log -p wa -k auth
+      -w /var/log/faillog -p wa -k logins
+      -w /var/log/lastlog -p wa -k logins
+      -w /etc/ssh/sshd_config -p wa -k sshd
+      -a always,exit -F arch=b64 -S adjtimex,settimeofday -k time-change
+      -a always,exit -F arch=b32 -S adjtimex,settimeofday,stime -k time-change
+      -a always,exit -F arch=b64 -S clock_settime -k time-change
+      -a always,exit -F arch=b32 -S clock_settime -k time-change
+      -w /etc/localtime -p wa -k time-change
+      -w /sbin/insmod -p x -k modules
+      -w /sbin/rmmod -p x -k modules
+      -w /sbin/modprobe -p x -k modules
+      -a always,exit -F arch=b64 -S init_module,delete_module -k modules
+    dest: /etc/audit/rules.d/hardening.rules
+    mode: '0640'
+  become: yes
+
+- name: Enable and start auditd service
+  ansible.builtin.systemd:
+    name: auditd
+    enabled: yes
+    state: started
+  become: yes
+
+- name: Configure fail2ban for SSH protection
+  ansible.builtin.copy:
+    content: |
+      [DEFAULT]
+      bantime = 3600
+      findtime = 600
+      maxretry = 5
+      destemail = root@localhost
+      sendername = Fail2Ban
+      action = %(action_mwl)s
+
+      [sshd]
+      enabled = true
+      port = ssh
+      filter = sshd
+      logpath = /var/log/auth.log
+      maxretry = 3
+    dest: /etc/fail2ban/jail.local
+    mode: '0644'
+  become: yes
+
+- name: Enable and start fail2ban service
+  ansible.builtin.systemd:
+    name: fail2ban
+    enabled: yes
+    state: started
+  become: yes
+
+- name: Configure unattended-upgrades for automatic security updates
+  ansible.builtin.copy:
+    content: |
+      Unattended-Upgrade::Allowed-Origins {
+          "${distro_id}:${distro_codename}-security";
+          "${distro_id}ESMApps:${distro_codename}-apps-security";
+          "${distro_id}ESM:${distro_codename}-infra-security";
+      };
+      Unattended-Upgrade::AutoFixInterruptedDpkg "true";
+      Unattended-Upgrade::MinimalSteps "true";
+      Unattended-Upgrade::InstallOnShutdown "false";
+      Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+      Unattended-Upgrade::Remove-Unused-Dependencies "true";
+      Unattended-Upgrade::Automatic-Reboot "false";
+      Unattended-Upgrade::Automatic-Reboot-WithUsers "false";
+    dest: /etc/apt/apt.conf.d/50unattended-upgrades
+    mode: '0644'
+  become: yes
+
+- name: Enable automatic updates
+  ansible.builtin.copy:
+    content: |
+      APT::Periodic::Update-Package-Lists "1";
+      APT::Periodic::Download-Upgradeable-Packages "1";
+      APT::Periodic::AutocleanInterval "7";
+      APT::Periodic::Unattended-Upgrade "1";
+    dest: /etc/apt/apt.conf.d/20auto-upgrades
+    mode: '0644'
+  become: yes
+
+- name: Install HashiCorp Vault CLI
+  ansible.builtin.shell: |
+    wget -qO- https://apt.releases.hashicorp.com/gpg | gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+    echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | tee /etc/apt/sources.list.d/hashicorp.list
+    apt-get update && apt-get install -y vault={{ vault_version }}
+  become: yes
+  args:
+    executable: /bin/bash
+    creates: /usr/bin/vault
+
+- name: Verify Vault installation
+  ansible.builtin.command: vault version
+  register: vault_version_output
+  changed_when: false
+
+- name: Create Vault configuration directory
+  ansible.builtin.file:
+    path: /etc/vault.d
+    state: directory
+    mode: '0755'
+  become: yes
+
+- name: Create Vault CLI helper configuration
+  ansible.builtin.copy:
+    content: |
+      export VAULT_ADDR="https://vault.example.com:8200"
+      export VAULT_SKIP_VERIFY=false
+    dest: /etc/profile.d/vault.sh
+    mode: '0644'
+  become: yes
+
+- name: Install security scanning tools
+  ansible.builtin.apt:
+    name:
+      - lynis
+      - rkhunter
+      - chkrootkit
+      - clamav
+      - clamav-daemon
+    state: present
+  become: yes
+
+- name: Update ClamAV virus definitions
+  ansible.builtin.command: freshclam
+  become: yes
+  ignore_errors: yes
+  changed_when: false
+
+- name: Configure SSH hardening
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: "{{ item.regexp }}"
+    line: "{{ item.line }}"
+    backup: yes
+  loop:
+    - { regexp: '^#?PermitRootLogin', line: 'PermitRootLogin no' }
+    - { regexp: '^#?PasswordAuthentication', line: 'PasswordAuthentication no' }
+    - { regexp: '^#?PubkeyAuthentication', line: 'PubkeyAuthentication yes' }
+    - { regexp: '^#?PermitEmptyPasswords', line: 'PermitEmptyPasswords no' }
+    - { regexp: '^#?X11Forwarding', line: 'X11Forwarding no' }
+    - { regexp: '^#?MaxAuthTries', line: 'MaxAuthTries 3' }
+    - { regexp: '^#?ClientAliveInterval', line: 'ClientAliveInterval 300' }
+    - { regexp: '^#?ClientAliveCountMax', line: 'ClientAliveCountMax 2' }
+    - { regexp: '^#?Protocol', line: 'Protocol 2' }
+  become: yes
+  notify: restart_sshd
+
+- name: Create SSH banner
+  ansible.builtin.copy:
+    content: |
+      ***************************************************************************
+                           AUTHORIZED ACCESS ONLY
+      ***************************************************************************
+      This system is for authorized use only. All activity is monitored and
+      logged. Unauthorized access is prohibited and will be prosecuted.
+      ***************************************************************************
+    dest: /etc/issue.net
+    mode: '0644'
+  become: yes
+
+- name: Enable SSH banner
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^#?Banner'
+    line: 'Banner /etc/issue.net'
+  become: yes
+  notify: restart_sshd
+
+- name: Create security audit script
+  ansible.builtin.copy:
+    content: |
+      #!/bin/bash
+
+      REPORT_DIR="/var/log/security-audit"
+      TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+
+      mkdir -p $REPORT_DIR
+
+      echo "Running security audit - $TIMESTAMP"
+
+      echo "=== Lynis Audit ===" > $REPORT_DIR/audit_${TIMESTAMP}.log
+      lynis audit system --quick >> $REPORT_DIR/audit_${TIMESTAMP}.log 2>&1
+
+      echo "=== RKHunter Scan ===" >> $REPORT_DIR/audit_${TIMESTAMP}.log
+      rkhunter --check --skip-keypress >> $REPORT_DIR/audit_${TIMESTAMP}.log 2>&1
+
+      echo "=== AppArmor Status ===" >> $REPORT_DIR/audit_${TIMESTAMP}.log
+      aa-status >> $REPORT_DIR/audit_${TIMESTAMP}.log 2>&1
+
+      echo "=== Audit Log Summary ===" >> $REPORT_DIR/audit_${TIMESTAMP}.log
+      aureport --summary >> $REPORT_DIR/audit_${TIMESTAMP}.log 2>&1
+
+      echo "Security audit complete: $REPORT_DIR/audit_${TIMESTAMP}.log"
+    dest: /usr/local/bin/security-audit
+    mode: '0755'
+  become: yes
+
+- name: Display security installation summary
+  ansible.builtin.debug:
+    msg:
+      - "Security baseline installed successfully"
+      - "Installed components:"
+      - "  - AppArmor (enforcing mode)"
+      - "  - Auditd (monitoring enabled)"
+      - "  - Fail2ban (SSH protection)"
+      - "  - Unattended-upgrades (automatic security updates)"
+      - "  - HashiCorp Vault CLI: {{ vault_version_output.stdout }}"
+      - "  - ClamAV antivirus"
+      - "  - Lynis, RKHunter (security auditing)"
+      - "Security audit script: /usr/local/bin/security-audit"

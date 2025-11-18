@@ -1,0 +1,292 @@
+---
+- name: Include version variables
+  ansible.builtin.include_vars:
+    file: "{{ playbook_dir }}/roles/k8s_prereqs/vars/main.yml"
+
+- name: Install AD/LDAP authentication packages
+  ansible.builtin.apt:
+    name:
+      - sssd
+      - sssd-tools
+      - realmd
+      - adcli
+      - krb5-user
+      - krb5-config
+      - samba-common-bin
+      - packagekit
+      - libpam-sss
+      - libnss-sss
+      - libsss-sudo
+      - oddjob
+      - oddjob-mkhomedir
+    state: present
+  become: yes
+
+- name: Install additional LDAP utilities
+  ansible.builtin.apt:
+    name:
+      - ldap-utils
+      - libpam-ldap
+      - libnss-ldap
+      - nscd
+    state: present
+  become: yes
+
+- name: Create SSSD configuration directory
+  ansible.builtin.file:
+    path: /etc/sssd
+    state: directory
+    mode: '0700'
+  become: yes
+
+- name: Create default SSSD configuration template
+  ansible.builtin.copy:
+    content: |
+      [sssd]
+      config_file_version = 2
+      services = nss, pam, sudo
+      domains = EXAMPLE.COM
+
+      [nss]
+      filter_groups = root
+      filter_users = root
+      reconnection_retries = 3
+
+      [pam]
+      reconnection_retries = 3
+      offline_credentials_expiration = 7
+      offline_failed_login_attempts = 3
+      offline_failed_login_delay = 5
+
+      [domain/EXAMPLE.COM]
+      id_provider = ad
+      auth_provider = ad
+      access_provider = ad
+      chpass_provider = ad
+
+      ad_domain = example.com
+      krb5_realm = EXAMPLE.COM
+      realmd_tags = manages-system joined-with-samba
+
+      cache_credentials = true
+      krb5_store_password_if_offline = true
+
+      default_shell = /bin/bash
+      fallback_homedir = /home/%u@%d
+
+      ldap_id_mapping = true
+      ldap_schema = ad
+      ldap_referrals = false
+
+      enumerate = false
+      use_fully_qualified_names = false
+    dest: /etc/sssd/sssd.conf.template
+    mode: '0600'
+  become: yes
+
+- name: Create Kerberos configuration template
+  ansible.builtin.copy:
+    content: |
+      [libdefaults]
+          default_realm = EXAMPLE.COM
+          dns_lookup_realm = true
+          dns_lookup_kdc = true
+          ticket_lifetime = 24h
+          renew_lifetime = 7d
+          forwardable = true
+          rdns = false
+          default_ccache_name = KEYRING:persistent:%{uid}
+
+      [realms]
+          EXAMPLE.COM = {
+              kdc = dc01.example.com
+              admin_server = dc01.example.com
+              default_domain = example.com
+          }
+
+      [domain_realm]
+          .example.com = EXAMPLE.COM
+          example.com = EXAMPLE.COM
+
+      [logging]
+          default = FILE:/var/log/krb5libs.log
+          kdc = FILE:/var/log/krb5kdc.log
+          admin_server = FILE:/var/log/kadmind.log
+    dest: /etc/krb5.conf.template
+    mode: '0644'
+  become: yes
+
+- name: Configure PAM to create home directories on login
+  ansible.builtin.lineinfile:
+    path: /etc/pam.d/common-session
+    line: "session required pam_mkhomedir.so skel=/etc/skel/ umask=0077"
+    insertafter: EOF
+  become: yes
+
+- name: Configure PAM for SSSD authentication
+  ansible.builtin.copy:
+    content: |
+      auth        required      pam_env.so
+      auth        sufficient    pam_unix.so nullok try_first_pass
+      auth        requisite     pam_succeed_if.so uid >= 1000 quiet_success
+      auth        sufficient    pam_sss.so use_first_pass
+      auth        required      pam_deny.so
+
+      account     required      pam_unix.so
+      account     sufficient    pam_localuser.so
+      account     sufficient    pam_succeed_if.so uid < 1000 quiet
+      account     [default=bad success=ok user_unknown=ignore] pam_sss.so
+      account     required      pam_permit.so
+
+      password    requisite     pam_pwquality.so try_first_pass local_users_only retry=3 authtok_type=
+      password    sufficient    pam_unix.so sha512 shadow nullok try_first_pass use_authtok
+      password    sufficient    pam_sss.so use_authtok
+      password    required      pam_deny.so
+
+      session     optional      pam_keyinit.so revoke
+      session     required      pam_limits.so
+      -session    optional      pam_systemd.so
+      session     required      pam_mkhomedir.so skel=/etc/skel/ umask=0077
+      session     [success=1 default=ignore] pam_succeed_if.so service in crond quiet use_uid
+      session     required      pam_unix.so
+      session     optional      pam_sss.so
+    dest: /etc/pam.d/system-auth-sss.template
+    mode: '0644'
+  become: yes
+
+- name: Configure NSSwitch for SSSD
+  ansible.builtin.lineinfile:
+    path: /etc/nsswitch.conf
+    regexp: "^{{ item.key }}:"
+    line: "{{ item.key }}: {{ item.value }}"
+    backup: yes
+  loop:
+    - { key: 'passwd', value: 'files sss' }
+    - { key: 'group', value: 'files sss' }
+    - { key: 'shadow', value: 'files sss' }
+    - { key: 'sudoers', value: 'files sss' }
+  become: yes
+
+- name: Create AD join helper script
+  ansible.builtin.copy:
+    content: |
+      #!/bin/bash
+      set -e
+
+      DOMAIN=${1:-example.com}
+      AD_USER=${2:-administrator}
+
+      echo "Domain: $DOMAIN"
+      echo "AD User: $AD_USER"
+      echo ""
+
+      echo "Discovering domain: $DOMAIN"
+      realm discover $DOMAIN
+
+      echo ""
+      echo "Joining domain..."
+      realm join --user=$AD_USER $DOMAIN
+
+      echo ""
+      echo "Restarting SSSD service..."
+      systemctl restart sssd
+
+      echo ""
+      echo "Verifying domain join..."
+      realm list
+
+      echo ""
+      echo "Domain join complete"
+      echo "Test authentication: id <ad_username>"
+      echo "Test login: su - <ad_username>"
+    dest: /usr/local/bin/ad-join.sh
+    mode: '0755'
+  become: yes
+
+- name: Create AD leave helper script
+  ansible.builtin.copy:
+    content: |
+      #!/bin/bash
+      set -e
+
+      DOMAIN=${1:-example.com}
+      AD_USER=${2:-administrator}
+
+      echo "Leaving domain: $DOMAIN"
+      realm leave --user=$AD_USER $DOMAIN
+
+      echo "Stopping SSSD service..."
+      systemctl stop sssd
+
+      echo "Domain leave complete!"
+    dest: /usr/local/bin/ad-leave.sh
+    mode: '0755'
+  become: yes
+
+- name: Ensure SSSD is enabled but not started
+  ansible.builtin.systemd:
+    name: sssd
+    enabled: yes
+    state: stopped
+  become: yes
+
+- name: Create AD integration documentation
+  ansible.builtin.copy:
+    content: |
+      Active Directory Integration
+
+      Prerequisites:
+      - Network connectivity to AD Domain Controllers
+      - DNS resolution for AD domain
+      - Valid AD service account credentials
+
+      Domain Join:
+
+      1. Update templates with your domain information:
+         - /etc/sssd/sssd.conf.template
+         - /etc/krb5.conf.template
+
+      2. Copy templates to active configuration:
+         sudo cp /etc/krb5.conf.template /etc/krb5.conf
+
+      3. Join the domain:
+         sudo ad-join.sh yourdomain.com administrator
+
+      4. Verify domain join:
+         realm list
+         id <ad_username>
+
+      Post-Join:
+
+      - Configure sudo access for AD groups in /etc/sudoers.d/
+      - Update SSSD access filters in /etc/sssd/sssd.conf
+      - Test authentication: su - <ad_username>
+
+      Troubleshooting:
+
+      - Check SSSD logs: /var/log/sssd/
+      - Test Kerberos: kinit <ad_username>@DOMAIN.COM
+      - Verify DNS: nslookup _ldap._tcp.dc._msdcs.DOMAIN.COM
+      - Check realm: realm list
+
+      Security:
+
+      - Always use service accounts for domain joins
+      - Restrict sudo access to specific AD groups
+      - Configure SSSD access filters to limit who can authenticate
+      - Monitor /var/log/sssd/ for unauthorized access attempts
+    dest: /etc/sssd/AD-INTEGRATION-GUIDE.md
+    mode: '0644'
+  become: yes
+
+- name: Display AD integration information
+  ansible.builtin.debug:
+    msg:
+      - "Active Directory prerequisites installed successfully"
+      - "Configuration templates available at:"
+      - "  - /etc/sssd/sssd.conf.template"
+      - "  - /etc/krb5.conf.template"
+      - "Helper scripts available:"
+      - "  - /usr/local/bin/ad-join.sh"
+      - "  - /usr/local/bin/ad-leave.sh"
+      - "Integration guide: /etc/sssd/AD-INTEGRATION-GUIDE.md"

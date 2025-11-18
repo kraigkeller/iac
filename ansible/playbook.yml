@@ -1,0 +1,223 @@
+---
+- name: Build Ubuntu 22.04 Image
+  hosts: all
+  become: yes
+  gather_facts: yes
+
+  vars:
+    image_build_timestamp: "{{ ansible_date_time.iso8601 }}"
+    image_version: "{{ lookup('env', 'IMAGE_VERSION') | default('1.0.0', true) }}"
+
+  pre_tasks:
+    - name: Display build information
+      ansible.builtin.debug:
+        msg:
+          - "Build Timestamp: {{ image_build_timestamp }}"
+          - "Image Version: {{ image_version }}"
+          - "Target Host: {{ ansible_hostname }}"
+          - "OS: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+
+    - name: Wait for system to be ready
+      ansible.builtin.wait_for_connection:
+        timeout: 300
+
+    - name: Ensure Python is installed
+      ansible.builtin.raw: test -e /usr/bin/python3 || (apt -y update && apt install -y python3-minimal)
+      changed_when: false
+
+  roles:
+    - role: common
+      tags: ['common', 'base']
+
+    - role: security
+      tags: ['security', 'hardening']
+
+    - role: docker
+      tags: ['docker', 'containers']
+
+    - role: k8s_prereqs
+      tags: ['kubernetes', 'k8s']
+
+    - role: observability
+      tags: ['observability', 'monitoring']
+
+    - role: ad_auth
+      tags: ['ad', 'authentication', 'ldap']
+
+  post_tasks:
+    - name: Remove SSH host keys
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/ssh/ssh_host_rsa_key
+        - /etc/ssh/ssh_host_rsa_key.pub
+        - /etc/ssh/ssh_host_ecdsa_key
+        - /etc/ssh/ssh_host_ecdsa_key.pub
+        - /etc/ssh/ssh_host_ed25519_key
+        - /etc/ssh/ssh_host_ed25519_key.pub
+      tags: ['cleanup', 'zero-identity']
+
+    - name: Remove machine-id
+      ansible.builtin.shell: |
+        truncate -s 0 /etc/machine-id
+        rm -f /var/lib/dbus/machine-id
+        ln -s /etc/machine-id /var/lib/dbus/machine-id
+      args:
+        executable: /bin/bash
+      tags: ['cleanup', 'zero-identity']
+
+    - name: Clear cloud-init data
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /var/lib/cloud/instance
+        - /var/lib/cloud/instances
+        - /var/log/cloud-init.log
+        - /var/log/cloud-init-output.log
+      tags: ['cleanup', 'zero-identity']
+
+    - name: Remove user histories
+      ansible.builtin.shell: |
+        find /home -name '.bash_history' -delete
+        find /home -name '.zsh_history' -delete
+        find /home -name '.python_history' -delete
+        find /root -name '.bash_history' -delete
+        find /root -name '.zsh_history' -delete
+        history -c
+      args:
+        executable: /bin/bash
+      ignore_errors: yes
+      tags: ['cleanup', 'zero-identity']
+
+    - name: Clear user SSH authorized keys
+      ansible.builtin.shell: |
+        find /home -type d -name '.ssh' -exec rm -rf {} + 2>/dev/null || true
+        find /root -type d -name '.ssh' -exec rm -rf {} + 2>/dev/null || true
+      args:
+        executable: /bin/bash
+      tags: ['cleanup', 'zero-identity']
+
+    - name: Remove temporary files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /tmp/*
+        - /var/tmp/*
+      tags: ['cleanup', 'zero-identity']
+
+    - name: Clear log files
+      ansible.builtin.shell: |
+        find /var/log -type f -name "*.log" -exec truncate -s 0 {} \;
+        find /var/log -type f -name "*.gz" -delete
+        find /var/log -type f -name "*.1" -delete
+        truncate -s 0 /var/log/lastlog
+        truncate -s 0 /var/log/wtmp
+        truncate -s 0 /var/log/btmp
+      args:
+        executable: /bin/bash
+      tags: ['cleanup', 'zero-identity']
+
+    - name: Remove netplan machine-id
+      ansible.builtin.shell: |
+        rm -f /etc/netplan/50-cloud-init.yaml
+      args:
+        executable: /bin/bash
+      ignore_errors: yes
+      tags: ['cleanup', 'zero-identity']
+
+    - name: Clear package cache
+      ansible.builtin.apt:
+        autoclean: yes
+        autoremove: yes
+      tags: ['cleanup', 'zero-identity']
+
+    - name: Remove DHCP leases
+      ansible.builtin.shell: |
+        rm -f /var/lib/dhcp/*
+      args:
+        executable: /bin/bash
+      tags: ['cleanup', 'zero-identity']
+
+    - name: Clear systemd journal
+      ansible.builtin.shell: |
+        journalctl --vacuum-time=1s
+      args:
+        executable: /bin/bash
+      tags: ['cleanup', 'zero-identity']
+
+    - name: Remove temporary Ansible files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /tmp/ansible*
+        - /tmp/get_helm.sh
+        - /var/log/ansible.log
+      tags: ['cleanup', 'zero-identity']
+
+    - name: Sync filesystem
+      ansible.builtin.command: sync
+      changed_when: false
+      tags: ['cleanup', 'zero-identity']
+
+    - name: Create image build manifest
+      ansible.builtin.copy:
+        content: |
+          # Golden Image Build Manifest
+          Build Date: {{ image_build_timestamp }}
+          Image Version: {{ image_version }}
+          Base OS: {{ ansible_distribution }} {{ ansible_distribution_version }}
+          Kernel: {{ ansible_kernel }}
+          Architecture: {{ ansible_architecture }}
+          
+          ## Installed Components
+          - Common utilities and base system configuration
+          - Docker {{ lookup('file', 'roles/k8s_prereqs/vars/main.yml') | regex_search('docker_version: "(.+)"', '\\1') | first }}
+          - Kubernetes tools (kubectl, kubeadm, kubelet)
+          - Helm {{ lookup('file', 'roles/k8s_prereqs/vars/main.yml') | regex_search('helm_version: "(.+)"', '\\1') | first }}
+          - Fluent Bit for observability
+          - SSSD/Realmd for Active Directory integration
+          - Certbot for HTTPS certificate management
+          
+          ## Zero-Identity Status
+          - SSH host keys removed
+          - Machine-ID cleared
+          - Cloud-init data removed
+          - User histories cleared
+          - SSH authorized keys removed
+          - Log files truncated
+          - DHCP leases cleared
+          - Temporary files removed
+          
+          ## Next Steps
+          1. Instances launched from this image will generate unique identities
+          2. Configure environment-specific settings (AD domain, monitoring endpoints)
+          3. Join to Kubernetes cluster if applicable
+          4. Configure application-specific settings
+          
+          Image ready for deployment.
+        dest: /etc/golden-image-manifest.txt
+        mode: '0644'
+      tags: ['cleanup', 'zero-identity']
+
+    - name: Display cleanup completion message
+      ansible.builtin.debug:
+        msg:
+          - "Zero-identity cleanup complete"
+          - "Removed items:"
+          - "  - SSH host keys"
+          - "  - Machine-ID"
+          - "  - Cloud-init instance data"
+          - "  - User command histories"
+          - "  - SSH authorized keys"
+          - "  - Temporary files"
+          - "  - Log files"
+          - "  - DHCP leases"
+          - "  - Package cache"
+          - ""
+          - "Image ready for AMI creation"
+          - "Build manifest: /etc/golden-image-manifest.txt"
+      tags: ['cleanup', 'zero-identity']

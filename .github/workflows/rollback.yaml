@@ -1,0 +1,255 @@
+name: AMI Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to rollback'
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - production
+      ami_id:
+        description: 'AMI ID to rollback to (leave empty to use previous version)'
+        required: false
+        type: string
+      reason:
+        description: 'Reason for rollback'
+        required: true
+        type: string
+
+env:
+  AWS_REGION: 'us-east-1'
+
+permissions:
+  contents: read
+  id-token: write
+  issues: write
+
+jobs:
+  validate-rollback:
+    name: Validate Rollback Request
+    runs-on: ubuntu-latest
+
+    outputs:
+      target_ami: ${{ steps.determine_ami.outputs.ami_id }}
+      current_ami: ${{ steps.get_current.outputs.ami_id }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets[format('AWS_ROLE_ARN_{0}', upper(github.event.inputs.environment))] }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get current AMI
+        id: get_current
+        run: |
+          CURRENT_AMI=$(aws ec2 describe-images \
+            --owners self \
+            --filters "Name=tag:Environment,Values=${{ github.event.inputs.environment }}" \
+                      "Name=tag:Production,Values=true" \
+            --query 'sort_by(Images, &CreationDate)[-1].ImageId' \
+            --output text)
+
+          echo "ami_id=${CURRENT_AMI}" >> $GITHUB_OUTPUT
+          echo "Current production AMI: ${CURRENT_AMI}"
+
+      - name: Determine target AMI
+        id: determine_ami
+        run: |
+          if [ -n "${{ github.event.inputs.ami_id }}" ]; then
+            TARGET_AMI="${{ github.event.inputs.ami_id }}"
+            echo "Using specified AMI: ${TARGET_AMI}"
+          else
+            TARGET_AMI=$(aws ec2 describe-images \
+              --owners self \
+              --filters "Name=tag:Environment,Values=${{ github.event.inputs.environment }}" \
+              --query 'sort_by(Images, &CreationDate)[-2].ImageId' \
+              --output text)
+            echo "Using previous version AMI: ${TARGET_AMI}"
+          fi
+
+          echo "ami_id=${TARGET_AMI}" >> $GITHUB_OUTPUT
+
+      - name: Validate target AMI exists
+        continue-on-error: false
+        run: |
+          AMI_STATE=$(aws ec2 describe-images \
+            --image-ids ${{ steps.determine_ami.outputs.ami_id }} \
+            --query 'Images[0].State' \
+            --output text 2>/dev/null || echo "not-found")
+
+          if [ "$AMI_STATE" != "available" ]; then
+            echo "Failed: AMI not available (${AMI_STATE})"
+            exit 1
+          fi
+
+      - name: Display rollback plan
+        run: |
+          echo "### Rollback Plan" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment:** ${{ github.event.inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Current AMI:** ${{ steps.get_current.outputs.ami_id }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Target AMI:** ${{ steps.determine_ami.outputs.ami_id }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Reason:** ${{ github.event.inputs.reason }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Initiated by:** ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+
+  execute-rollback:
+    name: Execute Rollback
+    runs-on: ubuntu-latest
+    needs: validate-rollback
+    environment:
+      name: ${{ github.event.inputs.environment }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets[format('AWS_ROLE_ARN_{0}', upper(github.event.inputs.environment))] }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Tag current AMI as superseded
+        run: |
+          aws ec2 create-tags \
+            --resources ${{ needs.validate-rollback.outputs.current_ami }} \
+            --tags \
+              Key=Status,Value=Superseded \
+              Key=SupersededDate,Value=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+              Key=SupersededBy,Value=${{ github.actor }} \
+              Key=RollbackReason,Value="${{ github.event.inputs.reason }}"
+
+      - name: Promote rollback AMI to production
+        run: |
+          aws ec2 create-tags \
+            --resources ${{ needs.validate-rollback.outputs.target_ami }} \
+            --tags \
+              Key=Production,Value=true \
+              Key=RolledBackDate,Value=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+              Key=RolledBackBy,Value=${{ github.actor }}
+
+      - name: Create launch template version with rollback AMI
+        id: launch_template
+        continue-on-error: true
+        run: |
+          LT_ID=$(aws ec2 describe-launch-templates \
+            --filters "Name=tag:Environment,Values=${{ github.event.inputs.environment }}" \
+            --query 'LaunchTemplates[0].LaunchTemplateId' \
+            --output text 2>/dev/null || echo "None")
+
+          if [ "$LT_ID" != "None" ] && [ -n "$LT_ID" ]; then
+            VERSION=$(aws ec2 create-launch-template-version \
+              --launch-template-id ${LT_ID} \
+              --source-version '$Latest' \
+              --launch-template-data "{\"ImageId\":\"${{ needs.validate-rollback.outputs.target_ami }}\"}" \
+              --version-description "Rollback to AMI ${{ needs.validate-rollback.outputs.target_ami }} - Reason: ${{ github.event.inputs.reason }}" \
+              --query 'LaunchTemplateVersion.VersionNumber' \
+              --output text)
+
+            aws ec2 modify-launch-template \
+              --launch-template-id ${LT_ID} \
+              --default-version ${VERSION}
+
+            echo "launch_template_id=${LT_ID}" >> $GITHUB_OUTPUT
+            echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          else
+            echo "launch_template_id=" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Trigger Auto Scaling Group refresh
+        if: steps.launch_template.outputs.launch_template_id != ''
+        continue-on-error: true
+        run: |
+          ASG_NAME=$(aws autoscaling describe-auto-scaling-groups \
+            --filters "Name=tag:Environment,Values=${{ github.event.inputs.environment }}" \
+            --query 'AutoScalingGroups[0].AutoScalingGroupName' \
+            --output text 2>/dev/null || echo "None")
+
+          if [ "$ASG_NAME" != "None" ] && [ -n "$ASG_NAME" ]; then
+            REFRESH_ID=$(aws autoscaling start-instance-refresh \
+              --auto-scaling-group-name ${ASG_NAME} \
+              --preferences '{"MinHealthyPercentage": 90, "InstanceWarmup": 300, "CheckpointPercentages": [50,100], "CheckpointDelay": 300}' \
+              --desired-configuration "{\"LaunchTemplate\":{\"LaunchTemplateId\":\"${{ steps.launch_template.outputs.launch_template_id }}\",\"Version\":\"${{ steps.launch_template.outputs.version }}\"}}" \
+              --query 'InstanceRefreshId' \
+              --output text)
+
+            echo "ASG refresh: ${REFRESH_ID}"
+          fi
+
+      - name: Create rollback record
+        run: |
+          mkdir -p rollback-records
+          cat > rollback-records/rollback-$(date +%Y%m%d-%H%M%S).json << EOF
+          {
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "environment": "${{ github.event.inputs.environment }}",
+            "initiated_by": "${{ github.actor }}",
+            "reason": "${{ github.event.inputs.reason }}",
+            "from_ami": "${{ needs.validate-rollback.outputs.current_ami }}",
+            "to_ami": "${{ needs.validate-rollback.outputs.target_ami }}",
+            "workflow_run": "${{ github.run_id }}"
+          }
+          EOF
+
+          cat rollback-records/rollback-*.json
+
+      - name: Upload rollback record
+        uses: actions/upload-artifact@v4
+        with:
+          name: rollback-record-${{ github.run_id }}
+          path: rollback-records/
+          retention-days: 365
+
+      - name: Create incident issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `[ROLLBACK] ${{ github.event.inputs.environment }} - ${{ github.event.inputs.reason }}`,
+              body: `## Rollback Executed
+
+              **Environment:** ${{ github.event.inputs.environment }}
+              **Initiated by:** @${{ github.actor }}
+              **Timestamp:** ${new Date().toISOString()}
+
+              ### Details
+              - **From AMI:** ${{ needs.validate-rollback.outputs.current_ami }}
+              - **To AMI:** ${{ needs.validate-rollback.outputs.target_ami }}
+              - **Reason:** ${{ github.event.inputs.reason }}
+
+              ### Actions Taken
+              - ✅ Previous AMI tagged as superseded
+              - ✅ Rollback AMI promoted to production
+              - ✅ Launch template updated (if applicable)
+              - ✅ Auto Scaling Group refresh initiated (if applicable)
+
+              ### Next Steps
+              1. Monitor application health
+              2. Verify rollback success
+              3. Investigate root cause of issue
+              4. Document lessons learned
+
+              **Workflow Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+              `,
+              labels: ['rollback', 'incident', `env:${{ github.event.inputs.environment }}`]
+            });
+
+            console.log(`Created issue #${issue.data.number}`);
+
+      - name: Rollback summary
+        run: |
+          echo "### Rollback Complete" >> $GITHUB_STEP_SUMMARY
+          echo "Environment: ${{ github.event.inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "From: ${{ needs.validate-rollback.outputs.current_ami }}" >> $GITHUB_STEP_SUMMARY
+          echo "To: ${{ needs.validate-rollback.outputs.target_ami }}" >> $GITHUB_STEP_SUMMARY
+          echo "Reason: ${{ github.event.inputs.reason }}" >> $GITHUB_STEP_SUMMARY

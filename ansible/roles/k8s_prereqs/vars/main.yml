@@ -1,0 +1,18 @@
+---
+docker_version: "5:24.0.7-1~ubuntu.22.04~jammy"
+docker_compose_version: "2.23.0"
+
+kubernetes_version: "1.28.4"
+kubectl_version: "1.28.4-1.1"
+kubeadm_version: "1.28.4-1.1"
+kubelet_version: "1.28.4-1.1"
+
+helm_version: "3.13.2"
+
+fluentbit_version: "2.2.0"
+node_exporter_version: "1.7.0"
+
+certbot_version: "2.7.4"
+
+sssd_version: "latest"
+realmd_version: "latest"
